@@ -1,0 +1,12 @@
+{
+    "autostart": false,
+    "protection_enabled": true,
+    "check_interval_ms": 500,
+    "protected_monitors": [2, 3],
+    "whitelist": [
+        "POWERPNT.EXE",
+        "OBS64.EXE",
+        "OBS32.EXE"
+    ],
+    "custom_whitelist": []
+}
