@@ -12,7 +12,6 @@ from pathlib import Path
 
 # Default whitelist entries
 DEFAULT_WHITELIST = [
-    "POWERPNT.EXE",
     "OBS64.EXE",
     "OBS32.EXE"
 ]
@@ -59,7 +58,6 @@ class Whitelist:
                 self._whitelist.add(entry)
 
         except Exception as e:
-            print(f"Error loading whitelist: {e}")
             self._whitelist = set(DEFAULT_WHITELIST)
             self._custom_whitelist = set()
 
@@ -81,7 +79,7 @@ class Whitelist:
                 json.dump(config, f, indent=4)
 
         except Exception as e:
-            print(f"Error saving whitelist: {e}")
+            pass
 
     def is_whitelisted(self, process_name: str) -> bool:
         """

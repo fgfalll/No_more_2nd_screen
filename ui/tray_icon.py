@@ -182,14 +182,16 @@ class TrayIconManager(QObject):
         about_text = """
         <h3>No More 2nd Screen</h3>
         <p>Version 1.0</p>
-        <p>Restricts projector monitor usage to whitelisted applications only.</p>
-        <p><b>Features:</b></p>
+        <p>Automatically moves non-whitelisted applications from projector monitors to the main display.</p>
+        <p><b>Key Features:</b></p>
         <ul>
-        <li>Automatically moves non-whitelisted apps from projectors to main monitor</li>
-        <li>Customizable whitelist</li>
-        <li>System tray operation</li>
+        <li>Protect projector monitors by restricting them to whitelisted apps</li>
+        <li>PowerPoint only allowed in slideshow/presentation mode</li>
+        <li>System tray application for easy management</li>
+        <li>Customizable whitelist and monitor selection</li>
         </ul>
-        <p>Default whitelisted applications: PowerPoint, OBS Studio</p>
+        <p><b>License:</b> Source-available for personal and non-commercial use only.</p>
+        <p>Commercial use requires explicit permission from the author.</p>
         """
 
         QMessageBox.information(

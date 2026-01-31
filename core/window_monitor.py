@@ -8,22 +8,33 @@ by moving non-whitelisted windows back to the primary monitor.
 import win32gui
 import win32con
 import win32process
+import win32api
 import psutil
-from typing import Optional, Callable, Dict
+import time
+from typing import Optional, Callable, Dict, Set, List
 from dataclasses import dataclass
 
 from .monitor_info import (
     get_primary_monitor,
-    is_window_on_any_projector,
-    get_monitor_by_index,
-    has_projectors
+    get_monitor_by_device_name,
+    get_device_name_for_hmonitor,
+    has_projectors,
+    is_window_on_monitor,
 )
 from .whitelist import get_whitelist
+
+VK_LBUTTON = 0x01
+
+
+def _is_dragging() -> bool:
+    """Check if user is actively dragging (left mouse button pressed)."""
+    return (win32api.GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0
 
 
 @dataclass
 class WindowMoveStats:
     """Statistics about moved windows."""
+
     total_moves: int = 0
     last_moved_process: str = ""
     last_moved_title: str = ""
@@ -34,24 +45,29 @@ class WindowMonitor:
     Monitors windows and enforces projector restrictions.
     """
 
-    def __init__(self, protected_monitor_indices=None, whitelist=None):
+    def __init__(self, protected_device_names=None, whitelist=None):
         """
         Initialize the window monitor.
 
         Args:
-            protected_monitor_indices: List of 1-based monitor indices to protect (default: [2, 3])
+            protected_device_names: List of device names to protect (e.g., ["\\\\.\\DISPLAY2", "\\\\.\\DISPLAY3"])
             whitelist: Whitelist instance (uses default if None)
         """
-        if protected_monitor_indices is None:
-            protected_monitor_indices = [2, 3]
+        if protected_device_names is None:
+            protected_device_names = ["\\\\.\\DISPLAY2", "\\\\.\\DISPLAY3"]
 
-        self.protected_monitor_indices = protected_monitor_indices
+        self.protected_device_names = protected_device_names
+        self.primary_device = None  # NEW: Always allowed monitor
         self.whitelist = whitelist or get_whitelist()
         self.enabled = True
         self.stats = WindowMoveStats()
 
-        # Callback for when a window is moved
         self.on_window_moved: Optional[Callable] = None
+
+        self._recently_moved: dict[int, float] = {}
+        self._move_debounce_ms = 500
+        self._was_dragging = False
+        self._deferred_hwnds: Set[int] = set()
 
     def is_enabled(self) -> bool:
         """Check if monitoring is enabled."""
@@ -66,14 +82,41 @@ class WindowMonitor:
         """
         self.enabled = enabled
 
-    def set_protected_monitors(self, indices):
+    def set_protected_devices(self, device_names: List[str]):
         """
-        Set which monitor indices to protect.
+        Set which device names to protect.
 
         Args:
-            indices: List of 1-based monitor indices (e.g., [2, 3])
+            device_names: List of device names (e.g., ["\\\\.\\DISPLAY2", "\\\\.\\DISPLAY3"])
         """
-        self.protected_monitor_indices = indices
+        self.protected_device_names = device_names
+
+    def _is_recently_moved(self, hwnd: int) -> bool:
+        """Check if window was moved within the debounce period."""
+        if hwnd in self._recently_moved:
+            elapsed = time.time() - self._recently_moved[hwnd]
+            if elapsed < self._move_debounce_ms / 1000.0:
+                return True
+        return False
+
+    def _cleanup_old_entries(self):
+        """Remove stale entries from recently_moved dict."""
+        current_time = time.time()
+        stale_threshold = current_time - (self._move_debounce_ms / 1000.0)
+        self._recently_moved = {
+            hwnd: ts
+            for hwnd, ts in self._recently_moved.items()
+            if ts >= stale_threshold
+        }
+
+    def set_primary_device(self, device_name: Optional[str]):
+        """
+        Set primary device (always allowed - protection turned OFF).
+
+        Args:
+            device_name: Device name to set as primary (e.g., "\\\\.\\DISPLAY2")
+        """
+        self.primary_device = device_name
 
     def get_process_name(self, hwnd: int) -> Optional[str]:
         """
@@ -105,11 +148,9 @@ class WindowMonitor:
         Returns:
             True if the window should be monitored, False otherwise.
         """
-        # Must be visible
         if not win32gui.IsWindowVisible(hwnd):
             return False
 
-        # Must have a title (excludes many system windows)
         try:
             title = win32gui.GetWindowText(hwnd)
             if not title:
@@ -117,16 +158,48 @@ class WindowMonitor:
         except Exception:
             return False
 
-        # Exclude certain window classes (e.g., shell windows)
         try:
             class_name = win32gui.GetClassName(hwnd)
-            # Skip shell windows and some system windows
-            if class_name in ['Shell_TrayWnd', 'Progman', 'WorkerW']:
+            if class_name in ["Shell_TrayWnd", "Progman", "WorkerW"]:
                 return False
         except Exception:
             return False
 
         return True
+
+    def is_window_on_device(self, hwnd: int, device_name: str) -> bool:
+        """
+        Check if a window is on a specific device.
+
+        Args:
+            hwnd: Window handle
+            device_name: Device name (e.g., "\\\\.\\DISPLAY2")
+
+        Returns:
+            True if window center is on the device, False otherwise.
+        """
+        monitor = get_monitor_by_device_name(device_name)
+        if monitor:
+            return is_window_on_monitor(hwnd, monitor)
+        return False
+
+    def _is_powerpoint_in_slideshow(self, hwnd: int, process_name: str) -> bool:
+        """Check if PowerPoint window is in slideshow/presentation mode."""
+        if process_name != "POWERPNT.EXE":
+            return False
+
+        try:
+            class_name = win32gui.GetClassName(hwnd)
+            window_title = win32gui.GetWindowText(hwnd)
+
+            # PowerPoint slideshow window class names:
+            # - "PPTFrameClass" (main window - NOT slideshow)
+            # - "screenClass" (slideshow window - this is what we want to allow)
+            # Window is slideshow if class is "screenClass"
+
+            return class_name == "screenClass"
+        except Exception:
+            return False
 
     def should_move_window(self, hwnd: int) -> tuple[bool, Optional[str]]:
         """
@@ -141,21 +214,33 @@ class WindowMonitor:
         if not self.enabled:
             return False, None
 
-        # Check if window is on a protected projector
-        if not is_window_on_any_projector(hwnd, self.protected_monitor_indices):
-            return False, None
-
-        # Get the process name
         process_name = self.get_process_name(hwnd)
+
         if not process_name:
-            # Unknown process - move to be safe
             return True, None
 
-        # Check if process is whitelisted
+        # Special handling for PowerPoint - only allow when in slideshow mode
+        if process_name == "POWERPNT.EXE":
+            if self._is_powerpoint_in_slideshow(hwnd, process_name):
+                return False, process_name  # Allow PowerPoint in slideshow mode
+            # PowerPoint NOT in slideshow mode - should be moved
+            for device_name in self.protected_device_names:
+                if self.is_window_on_device(hwnd, device_name):
+                    return True, process_name
+            return False, process_name
+
         if self.whitelist.is_whitelisted(process_name):
             return False, process_name
 
-        return True, process_name
+        # Skip if window is on the primary (always allowed) monitor
+        if self.primary_device and self.is_window_on_device(hwnd, self.primary_device):
+            return False, process_name
+
+        for device_name in self.protected_device_names:
+            if self.is_window_on_device(hwnd, device_name):
+                return True, process_name
+
+        return False, process_name
 
     def move_to_primary_monitor(self, hwnd: int) -> bool:
         """
@@ -199,13 +284,15 @@ class WindowMonitor:
                 new_y,
                 width,
                 height,
-                win32con.SWP_SHOWWINDOW | win32con.SWP_NOACTIVATE
+                win32con.SWP_SHOWWINDOW | win32con.SWP_NOACTIVATE,
             )
+
+            # Track when this window was last moved (debounce)
+            self._recently_moved[hwnd] = time.time()
 
             return True
 
         except Exception as e:
-            print(f"Error moving window: {e}")
             return False
 
     def check_and_enforce(self) -> int:
@@ -222,7 +309,39 @@ class WindowMonitor:
         if not has_projectors():
             return 0
 
+        # Clean up stale entries
+        self._cleanup_old_entries()
+
+        # Detect if user is currently dragging
+        is_currently_dragging = _is_dragging()
+
+        # Initialize moved counter
         moved_count = 0
+
+        # Detect drag end - apply deferred enforcement
+        if self._was_dragging and not is_currently_dragging:
+            # Drag just ended - process deferred windows
+            deferred = self._deferred_hwnds.copy()
+            self._deferred_hwnds.clear()
+            for hwnd in deferred:
+                if self.is_valid_window(hwnd) and not self._is_recently_moved(hwnd):
+                    if self.move_to_primary_monitor(hwnd):
+                        moved_count += 1
+                        self.stats.total_moves += 1
+                        try:
+                            title = win32gui.GetWindowText(hwnd)
+                            self.stats.last_moved_title = title
+                            self.stats.last_moved_process = (
+                                self.get_process_name(hwnd) or "Unknown"
+                            )
+                            if self.on_window_moved:
+                                self.on_window_moved(
+                                    hwnd, self.get_process_name(hwnd), title
+                                )
+                        except Exception:
+                            pass
+
+        self._was_dragging = is_currently_dragging
 
         def enum_callback(hwnd, _):
             nonlocal moved_count
@@ -230,31 +349,39 @@ class WindowMonitor:
             if not self.is_valid_window(hwnd):
                 return True
 
+            # Skip recently moved windows (debounce)
+            if self._is_recently_moved(hwnd):
+                return True
+
             should_move, process_name = self.should_move_window(hwnd)
 
             if should_move:
-                if self.move_to_primary_monitor(hwnd):
-                    moved_count += 1
-                    self.stats.total_moves += 1
+                if is_currently_dragging:
+                    # Defer enforcement until drag ends
+                    self._deferred_hwnds.add(hwnd)
+                else:
+                    if self.move_to_primary_monitor(hwnd):
+                        moved_count += 1
+                        self.stats.total_moves += 1
 
-                    # Try to get window info for stats
-                    try:
-                        title = win32gui.GetWindowText(hwnd)
-                        self.stats.last_moved_title = title
-                        self.stats.last_moved_process = process_name or "Unknown"
+                        # Try to get window info for stats
+                        try:
+                            title = win32gui.GetWindowText(hwnd)
+                            self.stats.last_moved_title = title
+                            self.stats.last_moved_process = process_name or "Unknown"
 
-                        # Call callback if set
-                        if self.on_window_moved:
-                            self.on_window_moved(hwnd, process_name, title)
-                    except Exception:
-                        pass
+                            # Call callback if set
+                            if self.on_window_moved:
+                                self.on_window_moved(hwnd, process_name, title)
+                        except Exception:
+                            pass
 
             return True
 
         try:
             win32gui.EnumWindows(enum_callback, None)
         except Exception as e:
-            print(f"Error enumerating windows: {e}")
+            pass
 
         return moved_count
 
@@ -276,12 +403,12 @@ class WindowMonitor:
 _monitor_instance = None
 
 
-def get_window_monitor(protected_monitor_indices=None) -> WindowMonitor:
+def get_window_monitor(protected_device_names=None) -> WindowMonitor:
     """
     Get the global window monitor instance.
 
     Args:
-        protected_monitor_indices: Optional monitor indices to protect
+        protected_device_names: Optional device names to protect
 
     Returns:
         WindowMonitor instance
@@ -289,7 +416,7 @@ def get_window_monitor(protected_monitor_indices=None) -> WindowMonitor:
     global _monitor_instance
 
     if _monitor_instance is None:
-        _monitor_instance = WindowMonitor(protected_monitor_indices)
+        _monitor_instance = WindowMonitor(protected_device_names)
 
     return _monitor_instance
 

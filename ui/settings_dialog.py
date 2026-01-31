@@ -2,63 +2,83 @@
 Settings dialog module.
 
 This module provides the settings UI for managing the whitelist,
-enabling/disabling protection, and autostart settings.
+enabling/disabling protection, autostart settings, and monitor configuration
+with support for combined displays and primary monitor selection.
 """
 
-import sys
 from PySide6.QtWidgets import (
-    QDialog, QVBoxLayout, QHBoxLayout, QLabel,
-    QCheckBox, QPushButton, QListWidget, QListWidgetItem,
-    QLineEdit, QMessageBox, QDialogButtonBox, QWidget,
-    QGroupBox, QFormLayout, QSpinBox
+    QDialog,
+    QVBoxLayout,
+    QHBoxLayout,
+    QLabel,
+    QCheckBox,
+    QPushButton,
+    QListWidget,
+    QListWidgetItem,
+    QInputDialog,
+    QMessageBox,
+    QDialogButtonBox,
+    QWidget,
+    QGroupBox,
+    QFormLayout,
+    QSpinBox,
+    QTreeWidget,
+    QTreeWidgetItem,
+    QTreeWidgetItemIterator,
+    QHeaderView,
 )
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QFont
 
+import sys
 import win32gui
 import win32con
 import win32process
 import psutil
 
+from core.monitor_info import (
+    get_monitors,
+    get_monitor_groups,
+    set_primary_monitor,
+    get_primary_device_name,
+    MonitorGroup,
+)
+
 
 class SettingsDialog(QDialog):
     """Settings dialog for the application."""
 
-    # Signal emitted when settings are changed
     settings_changed = Signal()
 
     def __init__(self, config, whitelist, parent=None):
-        """
-        Initialize the settings dialog.
-
-        Args:
-            config: Configuration dictionary
-            whitelist: Whitelist instance
-            parent: Parent widget
-        """
+        """Initialize the settings dialog."""
         super().__init__(parent)
         self.config = config
         self.whitelist = whitelist
 
         self.setWindowTitle("Settings")
-        self.setMinimumWidth(500)
-        self.setMinimumHeight(400)
+        self.setMinimumWidth(600)
+        self.setMinimumHeight(600)
+
+        # Track if settings have been modified
+        self._modified = False
+        self._original_config = self.config.copy()
 
         self.setup_ui()
         self.load_settings()
+        self.refresh_whitelist_list()
+        self._load_monitor_groups()
 
     def setup_ui(self):
         """Set up the UI components."""
         layout = QVBoxLayout(self)
 
-        # General Settings Group
         general_group = QGroupBox("General Settings")
         general_layout = QVBoxLayout()
 
         self.chk_enable_protection = QCheckBox("Enable protection on startup")
         self.chk_autostart = QCheckBox("Start with Windows")
 
-        # Check interval setting
         interval_layout = QHBoxLayout()
         interval_label = QLabel("Check interval (ms):")
         self.spin_interval = QSpinBox()
@@ -74,38 +94,53 @@ class SettingsDialog(QDialog):
         general_layout.addLayout(interval_layout)
         general_group.setLayout(general_layout)
 
-        # Protected Monitors Group
-        monitors_group = QGroupBox("Protected Monitor Indices")
-        monitors_layout = QHBoxLayout()
-        monitors_label = QLabel("Monitor indices to protect:")
-        self.spin_monitors = QSpinBox()
-        self.spin_monitors.setMinimum(2)
-        self.spin_monitors.setMaximum(9)
-        self.spin_monitors.setValue(3)
-        monitors_info = QLabel("(e.g., 3 = protect monitors 2 & 3)")
-        monitors_layout.addWidget(monitors_label)
-        monitors_layout.addWidget(self.spin_monitors)
-        monitors_layout.addWidget(monitors_info)
-        monitors_layout.addStretch()
+        monitors_group = QGroupBox("Protected Monitors")
+        monitors_layout = QVBoxLayout()
+
+        info_label = QLabel(
+            "Select monitors to protect. Windows will be prevented from "
+            "moving non-whitelisted applications to these monitors."
+        )
+        info_label.setFont(QFont("", 9))
+        info_label.setWordWrap(True)
+        monitors_layout.addWidget(info_label)
+
+        self.tree_monitors = QTreeWidget()
+        self.tree_monitors.setHeaderHidden(True)
+        self.tree_monitors.setMinimumHeight(200)
+        self.tree_monitors.setColumnCount(1)
+        self.tree_monitors.setHeaderLabels(["Monitors"])
+        self.tree_monitors.setHeaderLabels(["Monitors"])
+        monitors_layout.addWidget(self.tree_monitors)
+
+        refresh_layout = QHBoxLayout()
+        self.btn_refresh = QPushButton("Refresh")
+        self.btn_set_primary = QPushButton("Set as Primary")
+        self.btn_set_primary.setEnabled(False)
+        refresh_layout.addStretch()
+        refresh_layout.addWidget(self.btn_set_primary)
+        refresh_layout.addWidget(self.btn_refresh)
+        monitors_layout.addLayout(refresh_layout)
+
+        self.lbl_status = QLabel("")
+        self.lbl_status.setFont(QFont("", 9))
+        self.lbl_status.setStyleSheet("color: gray;")
+        monitors_layout.addWidget(self.lbl_status)
+
         monitors_group.setLayout(monitors_layout)
 
-        # Whitelist Group
         whitelist_group = QGroupBox("Whitelisted Applications")
         whitelist_layout = QVBoxLayout()
 
-        # Info label
         info_label = QLabel("These applications are allowed on projector monitors:")
         info_label.setFont(QFont("", 9))
         whitelist_layout.addWidget(info_label)
 
-        # Whitelist list
         self.list_whitelist = QListWidget()
         self.list_whitelist.setMinimumHeight(150)
         whitelist_layout.addWidget(self.list_whitelist)
 
-        # Buttons
         buttons_layout = QHBoxLayout()
-
         self.btn_add_process = QPushButton("Add Process...")
         self.btn_add_executable = QPushButton("Add by Name...")
         self.btn_remove = QPushButton("Remove")
@@ -119,40 +154,118 @@ class SettingsDialog(QDialog):
         whitelist_layout.addLayout(buttons_layout)
         whitelist_group.setLayout(whitelist_layout)
 
-        # Dialog buttons
         self.button_box = QDialogButtonBox(
             QDialogButtonBox.Ok | QDialogButtonBox.Cancel | QDialogButtonBox.Apply
         )
-        self.button_box.button(QDialogButtonBox.Apply).clicked.connect(self.apply_settings)
+        self.button_box.button(QDialogButtonBox.Apply).clicked.connect(
+            self.apply_settings
+        )
         self.button_box.accepted.connect(self.ok_clicked)
         self.button_box.rejected.connect(self.reject)
 
-        # Add all to main layout
         layout.addWidget(general_group)
         layout.addWidget(monitors_group)
         layout.addWidget(whitelist_group)
         layout.addStretch()
         layout.addWidget(self.button_box)
 
-        # Connect signals
         self.list_whitelist.itemSelectionChanged.connect(self.on_selection_changed)
         self.btn_add_process.clicked.connect(self.add_process_by_window)
         self.btn_add_executable.clicked.connect(self.add_process_by_name)
         self.btn_remove.clicked.connect(self.remove_process)
+        self.btn_refresh.clicked.connect(self._load_monitor_groups)
+        self.btn_set_primary.clicked.connect(self.set_primary_monitor)
+        self.tree_monitors.itemChanged.connect(self._update_status_label)
+        self.tree_monitors.itemSelectionChanged.connect(self._on_monitor_selection_changed)
+        self.tree_monitors.itemChanged.connect(self._mark_modified)
+
+        # Track modifications to UI controls
+        self.chk_enable_protection.stateChanged.connect(self._mark_modified)
+        self.chk_autostart.stateChanged.connect(self._mark_modified)
+        self.spin_interval.valueChanged.connect(self._mark_modified)
+
+    def _mark_modified(self):
+        """Mark settings as modified."""
+        self._modified = True
+
+    def _has_changes(self) -> bool:
+        """Check if settings have been modified."""
+        return self._modified
 
     def load_settings(self):
-        """Load settings from config."""
-        self.chk_enable_protection.setChecked(self.config.get('protection_enabled', True))
-        self.chk_autostart.setChecked(self.config.get('autostart', False))
-        self.spin_interval.setValue(self.config.get('check_interval_ms', 500))
+        """Load settings from config into UI controls."""
+        self.chk_enable_protection.setChecked(
+            self.config.get("protection_enabled", True)
+        )
+        self.chk_autostart.setChecked(
+            self.config.get("autostart", False)
+        )
+        self.spin_interval.setValue(
+            self.config.get("check_interval_ms", 500)
+        )
 
-        # Load protected monitors
-        protected = self.config.get('protected_monitors', [2, 3])
-        if protected:
-            self.spin_monitors.setValue(max(protected))
+    def _load_monitor_groups(self):
+        """Load monitor groups and build tree view."""
+        self.tree_monitors.clear()
 
-        # Load whitelist
-        self.refresh_whitelist_list()
+        self.monitor_groups = get_monitor_groups()
+        self.current_primary = get_primary_device_name()
+
+        for group in self.monitor_groups:
+            group_item = QTreeWidgetItem(self.tree_monitors)
+            group_item.setText(0, f"{group.icon} {group.name}")
+            
+            font = QFont()
+            if group.is_primary:
+                font.setBold(True)
+                font.setPointSize(10)
+                group_item.setFont(0, font)
+            elif group.is_clone:
+                font.setItalic(True)
+                group_item.setFont(0, font)
+
+            group_item.setData(0, Qt.UserRole, group)
+            group_item.setExpanded(True)
+
+            for device_name in group.device_names:
+                device_item = QTreeWidgetItem(group_item)
+                device_item.setFlags(device_item.flags() | Qt.ItemIsUserCheckable)
+                device_item.setText(0, device_name.split("\\")[-1])
+                
+                is_protected = device_name in self._get_protected_devices()
+                device_item.setCheckState(0, Qt.Checked if is_protected else Qt.Unchecked)
+
+                if device_name == self.current_primary:
+                    font = QFont()
+                    font.setItalic(True)
+                    device_item.setFont(0, font)
+
+        self.tree_monitors.resizeColumnToContents(0)
+        self._update_status_label()
+
+    def _get_protected_devices(self) -> list:
+        """Get list of protected device names."""
+        protected = self.config.get("protected_monitors", [])
+        return protected if protected else []
+
+    def _update_status_label(self):
+        """Update the status label."""
+        protected = self._get_protected_devices()
+        monitor_groups = self.monitor_groups
+        total_monitors = sum(len(g.device_names) for g in monitor_groups if not g.is_clone)
+
+        if not total_monitors:
+            self.lbl_status.setText("No monitors to protect")
+            self.lbl_status.setStyleSheet("color: orange;")
+        elif len(protected) == 0:
+            self.lbl_status.setText(f"{total_monitors} monitor(s) available - no protection")
+            self.lbl_status.setStyleSheet("color: orange;")
+        elif len(protected) >= total_monitors:
+            self.lbl_status.setText(f"All {total_monitors} monitors protected")
+            self.lbl_status.setStyleSheet("color: red;")
+        else:
+            self.lbl_status.setText(f"{len(protected)} of {total_monitors} monitors protected")
+            self.lbl_status.setStyleSheet("color: green;")
 
     def refresh_whitelist_list(self):
         """Refresh the whitelist display."""
@@ -162,12 +275,7 @@ class SettingsDialog(QDialog):
 
         for process_name in all_whitelisted:
             item = QListWidgetItem(process_name)
-
-            # Mark default entries
-            if self.whitelist.is_default(process_name):
-                item.setForeground(Qt.darkGray)
-                item.setText(f"{process_name} (default)")
-
+            item.setForeground(Qt.black)
             self.list_whitelist.addItem(item)
 
     def on_selection_changed(self):
@@ -175,12 +283,67 @@ class SettingsDialog(QDialog):
         has_selection = len(self.list_whitelist.selectedItems()) > 0
         self.btn_remove.setEnabled(has_selection)
 
-        # Don't allow removing default entries
-        if has_selection:
-            item = self.list_whitelist.selectedItems()[0]
-            text = item.text()
-            if text.endswith("(default)"):
-                self.btn_remove.setEnabled(False)
+    def _on_monitor_selection_changed(self):
+        """Handle selection change in monitors tree."""
+        selected_items = self.tree_monitors.selectedItems()
+        if selected_items:
+            # Only allow setting a monitor as primary if it's not already primary
+            item = selected_items[0]
+            group = item.data(0, Qt.UserRole)
+            if isinstance(group, MonitorGroup) and not group.is_primary:
+                self.btn_set_primary.setEnabled(True)
+            else:
+                self.btn_set_primary.setEnabled(False)
+        else:
+            self.btn_set_primary.setEnabled(False)
+
+    def set_primary_monitor(self):
+        """Set the selected monitor as primary."""
+        selected_items = self.tree_monitors.selectedItems()
+        if not selected_items:
+            return
+
+        item = selected_items[0]
+        group = item.data(0, Qt.UserRole)
+
+        if not isinstance(group, MonitorGroup):
+            return
+
+        if group.is_primary:
+            QMessageBox.information(self, "Info", "This monitor is already set as primary.")
+            return
+
+        # Get the device name from the group
+        if not group.device_names:
+            QMessageBox.warning(self, "Error", "No device name found for this monitor.")
+            return
+
+        device_name = group.device_names[0]
+
+        reply = QMessageBox.question(
+            self,
+            "Set Primary Monitor",
+            f"Set {group.name} as the primary monitor?\n\n"
+            "This will change your Windows display settings and may move all windows to this monitor.",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+
+        if reply == QMessageBox.Yes:
+            try:
+                success = set_primary_monitor(device_name)
+                if success:
+                    self.config["primary_monitor"] = device_name
+                    self._load_monitor_groups()  # Refresh the display
+                    QMessageBox.information(
+                        self, "Success", f"{group.name} has been set as the primary monitor."
+                    )
+                else:
+                    QMessageBox.warning(
+                        self, "Error", "Failed to set primary monitor. You may need administrator privileges."
+                    )
+            except Exception as e:
+                QMessageBox.warning(self, "Error", f"Failed to set primary monitor: {e}")
 
     def add_process_by_window(self):
         """Add a process by selecting from running windows."""
@@ -193,12 +356,10 @@ class SettingsDialog(QDialog):
 
     def add_process_by_name(self):
         """Add a process by entering the executable name."""
-        from PySide6.QtWidgets import QInputDialog
-
         process_name, ok = QInputDialog.getText(
             self,
             "Add Process by Name",
-            "Enter the executable name (e.g., NOTEPAD.EXE):"
+            "Enter the executable name (e.g., NOTEPAD.EXE):",
         )
 
         if ok and process_name:
@@ -211,18 +372,16 @@ class SettingsDialog(QDialog):
         if current_item:
             text = current_item.text()
 
-            # Extract process name (remove "(default)" suffix if present)
-            if " (default)" in text:
+            if "(default)" in text:
                 process_name = text.replace(" (default)", "")
             else:
                 process_name = text
 
-            # Don't remove default entries
             if self.whitelist.is_default(process_name):
                 QMessageBox.warning(
                     self,
                     "Cannot Remove",
-                    "Cannot remove default whitelisted applications."
+                    "Cannot remove default whitelisted applications.",
                 )
                 return
 
@@ -231,36 +390,79 @@ class SettingsDialog(QDialog):
 
     def apply_settings(self):
         """Apply the current settings."""
-        # Update config
-        self.config['protection_enabled'] = self.chk_enable_protection.isChecked()
-        self.config['check_interval_ms'] = self.spin_interval.value()
+        self.config["protection_enabled"] = self.chk_enable_protection.isChecked()
+        self.config["check_interval_ms"] = self.spin_interval.value()
 
-        # Update protected monitors
-        max_monitor = self.spin_monitors.value()
-        self.config['protected_monitors'] = list(range(2, max_monitor + 1))
+        protected_devices = self._get_selected_protected_devices()
 
-        # Update autostart
+        if protected_devices:
+            self.config["protected_monitors"] = protected_devices
+        else:
+            self.config["protected_monitors"] = []
+
         self.set_autostart(self.chk_autostart.isChecked())
 
-        # Save config
         self.save_config()
 
-        # Emit signal
         self.settings_changed.emit()
 
-        QMessageBox.information(self, "Settings", "Settings applied successfully.")
+        # Reset modified flag after applying
+        self._modified = False
+
+    def _get_selected_protected_devices(self) -> list:
+        """Get the list of selected protected device names."""
+        protected = []
+
+        iterator = QTreeWidgetItemIterator(self.tree_monitors)
+        while iterator.value():
+            item = iterator.value()
+            # Only process child items (devices), not group items
+            if item.parent() is not None:
+                if item.checkState(0) == Qt.Checked:
+                    # Get the device name from the parent group's data
+                    parent = item.parent()
+                    group = parent.data(0, Qt.UserRole)
+                    if isinstance(group, MonitorGroup):
+                        # Get the device name from the item text (e.g., "DISPLAY1")
+                        device_short_name = item.text(0)
+                        # Convert short name to full device name
+                        for device_name in group.device_names:
+                            if device_name.endswith(device_short_name) or device_short_name in device_name:
+                                protected.append(device_name)
+                                break
+
+            iterator += 1
+
+        return protected
 
     def ok_clicked(self):
         """Handle OK button click."""
-        self.apply_settings()
-        self.accept()
+        if self._has_changes():
+            reply = QMessageBox.question(
+                self,
+                "Unsaved Changes",
+                "You have unsaved changes. Do you want to apply them before closing?",
+                QMessageBox.Apply | QMessageBox.Discard | QMessageBox.Cancel,
+                QMessageBox.Apply,
+            )
+
+            if reply == QMessageBox.Apply:
+                self.apply_settings()
+                self.accept()
+            elif reply == QMessageBox.Discard:
+                # Discard changes and close
+                self.accept()
+            else:  # Cancel
+                return
+        else:
+            self.accept()
 
     def set_autostart(self, enabled):
         """
         Enable or disable application autostart.
 
         Args:
-            enabled: True to enable autostart, False to disable
+            enabled: True to enable, False to disable
         """
         import winreg
 
@@ -268,62 +470,64 @@ class SettingsDialog(QDialog):
 
         try:
             key = winreg.OpenKey(
-                winreg.HKEY_CURRENT_USER,
-                key_path,
-                0,
-                winreg.KEY_SET_VALUE
+                winreg.HKEY_CURRENT_USER, key_path, 0, winreg.KEY_SET_VALUE
             )
 
             if enabled:
-                # Get the path to the executable
                 app_path = sys.executable
-                # If running as python script, use the python interpreter
                 if app_path.endswith("python.exe"):
-                    # Try to get the main script path
                     import os
                     script_path = os.path.abspath("main.py")
                     app_path = f'"{app_path}" "{script_path}"'
 
-                winreg.SetValueEx(
-                    key,
-                    "NoMore2ndScreen",
-                    0,
-                    winreg.REG_SZ,
-                    app_path
-                )
+                winreg.SetValueEx(key, "NoMore2ndScreen", 0, winreg.REG_SZ, app_path)
+                self.config["autostart"] = True
             else:
                 try:
                     winreg.DeleteValue(key, "NoMore2ndScreen")
                 except FileNotFoundError:
                     pass
 
-            winreg.CloseKey(key)
-            self.config['autostart'] = enabled
+                self.config["autostart"] = False
 
+            winreg.CloseKey(key)
         except Exception as e:
-            QMessageBox.warning(
-                self,
-                "Autostart Error",
-                f"Could not set autostart: {e}"
-            )
+            QMessageBox.warning(self, "Autostart Error", f"Could not set autostart: {e}")
 
     def save_config(self):
         """Save configuration to file."""
         import json
         from pathlib import Path
 
-        script_dir = Path(__file__).parent.parent
+        script_dir = Path(__file__).parent
         config_path = script_dir / "config.json"
 
         try:
-            with open(config_path, 'w', encoding='utf-8') as f:
-                json.dump(self.config, f, indent=4)
-        except Exception as e:
-            QMessageBox.warning(
-                self,
-                "Save Error",
-                f"Could not save configuration: {e}"
+            existing_config = {}
+            if config_path.exists():
+                with open(config_path, "r", encoding="utf-8") as f:
+                    existing_config = json.load(f)
+
+            existing_config["autostart"] = self.config.get("autostart", False)
+            existing_config["protection_enabled"] = self.config.get(
+                "protection_enabled", True
             )
+            existing_config["check_interval_ms"] = self.config.get(
+                "check_interval_ms", 500
+            )
+
+            protected_devices = self._get_selected_protected_devices()
+            existing_config["protected_monitors"] = protected_devices if protected_devices else []
+
+            primary_monitor = self.config.get("primary_monitor", "")
+            if primary_monitor:
+                existing_config["primary_monitor"] = primary_monitor
+
+            with open(config_path, "w", encoding="utf-8") as f:
+                json.dump(existing_config, f, indent=4)
+
+        except Exception as e:
+            QMessageBox.warning(self, "Save Error", f"Could not save configuration: {e}")
 
 
 class WindowPickerDialog(QDialog):
@@ -347,29 +551,26 @@ class WindowPickerDialog(QDialog):
         layout.addWidget(label)
 
         self.list_windows = QListWidget()
+        self.list_windows.setMinimumHeight(200)
         layout.addWidget(self.list_windows)
 
-        # Refresh button
         refresh_layout = QHBoxLayout()
         self.btn_refresh = QPushButton("Refresh")
         refresh_layout.addStretch()
         refresh_layout.addWidget(self.btn_refresh)
         layout.addLayout(refresh_layout)
 
-        # Dialog buttons
-        buttons = QDialogButtonBox(
+        self.buttons = QDialogButtonBox(
             QDialogButtonBox.Ok | QDialogButtonBox.Cancel
         )
-        buttons.accepted.connect(self.accept)
-        buttons.rejected.connect(self.reject)
-        layout.addWidget(buttons)
+        self.buttons.accepted.connect(self.accept)
+        self.buttons.rejected.connect(self.reject)
 
-        # Connect signals
-        self.btn_refresh.clicked.connect(self.refresh_windows)
+        layout.addWidget(self.buttons)
+
         self.list_windows.itemDoubleClicked.connect(lambda: self.accept())
 
-        # Load initial windows
-        self.refresh_windows()
+        self.btn_refresh.clicked.connect(self.refresh_windows)
 
     def refresh_windows(self):
         """Refresh the list of running windows."""
@@ -378,8 +579,7 @@ class WindowPickerDialog(QDialog):
         windows = self.get_running_windows()
 
         for title, process_name in windows:
-            display_text = f"{title} ({process_name})"
-            item = QListWidgetItem(display_text)
+            item = QListWidgetItem(f"{title} ({process_name})")
             item.setData(Qt.UserRole, process_name)
             self.list_windows.addItem(item)
 
@@ -388,42 +588,48 @@ class WindowPickerDialog(QDialog):
         windows = []
 
         def enum_callback(hwnd, _):
-            # Only visible windows
             if not win32gui.IsWindowVisible(hwnd):
                 return True
 
-            # Get window title
             try:
                 title = win32gui.GetWindowText(hwnd)
                 if not title:
                     return True
 
-                # Get process name
-                _, pid = win32process.GetWindowThreadProcessId(hwnd)
-                if pid:
-                    try:
-                        process = psutil.Process(pid)
-                        process_name = process.name().upper()
+                # Skip certain system window classes
+                try:
+                    class_name = win32gui.GetClassName(hwnd)
+                    if class_name in ["Shell_TrayWnd", "Progman", "WorkerW", "DV2Host"]:
+                        return True
+                except Exception:
+                    pass
 
-                        # Skip system processes
-                        if process_name in ['SYSTEM', 'IDLE PROCESS']:
-                            return True
+                process_name = "Unknown"
+                try:
+                    _, pid = win32process.GetWindowThreadProcessId(hwnd)
+                    if pid:
+                        try:
+                            process = psutil.Process(pid)
+                            process_name = process.name().upper()
 
-                        windows.append((title, process_name))
-                    except (psutil.NoSuchProcess, psutil.AccessDenied):
-                        pass
+                            # Skip system processes
+                            if process_name in ["SYSTEM", "IDLE PROCESS", "SYSTEM IDLE PROCESS"]:
+                                return True
+                        except (psutil.NoSuchProcess, psutil.AccessDenied):
+                            process_name = "Unknown"
+                except Exception:
+                    process_name = "Unknown"
 
+                windows.append((title, process_name))
+                return True
             except Exception:
                 pass
 
-            return True
-
         try:
             win32gui.EnumWindows(enum_callback, None)
-        except Exception:
+        except Exception as e:
             pass
 
-        # Sort by title and remove duplicates
         seen = set()
         unique_windows = []
         for title, process_name in sorted(windows, key=lambda x: x[0]):
