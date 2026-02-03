@@ -32,6 +32,7 @@ from PySide6.QtGui import QFont
 
 import sys
 import os
+from pathlib import Path
 import win32gui
 import win32con
 import win32process
@@ -46,9 +47,8 @@ from core.monitor_info import (
 )
 
 
-def get_config_path() -> str:
+def get_config_path() -> Path:
     """Get config file path, using AppData for PyInstaller builds."""
-    from pathlib import Path
     if getattr(sys, 'frozen', False):
         # Running as exe - use AppData directory
         config_dir = Path(os.environ.get('APPDATA', os.path.expanduser('~')))
@@ -58,7 +58,7 @@ def get_config_path() -> str:
         config_dir = Path(__file__).parent.parent
 
     config_dir.mkdir(parents=True, exist_ok=True)
-    return str(config_dir / "config.json")
+    return config_dir / "config.json"
 
 
 class SettingsDialog(QDialog):

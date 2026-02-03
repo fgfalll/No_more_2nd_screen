@@ -2,9 +2,7 @@
     "autostart": false,
     "protection_enabled": true,
     "check_interval_ms": 500,
-    "protected_monitors": [
-        "\\\\.\\DISPLAY2"
-    ],
+    "protected_monitors": [],
     "whitelist": [
         "OBS32.EXE",
         "POWERPNT.EXE",
