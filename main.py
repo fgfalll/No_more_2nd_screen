@@ -10,6 +10,7 @@ primary monitor (1).
 """
 
 import sys
+import os
 import json
 from pathlib import Path
 from typing import List
@@ -28,6 +29,20 @@ from core.whitelist import get_whitelist
 from core.window_monitor import get_window_monitor
 from ui.tray_icon import TrayIconManager
 from ui.settings_dialog import SettingsDialog
+
+
+def get_config_path() -> Path:
+    """Get config file path, using AppData for PyInstaller builds."""
+    if getattr(sys, 'frozen', False):
+        # Running as exe - use AppData directory
+        config_dir = Path(os.environ.get('APPDATA', os.path.expanduser('~')))
+        config_dir = config_dir / "NoMore2ndScreen"
+    else:
+        # Running as Python script - use same directory as script
+        config_dir = Path(__file__).parent
+
+    config_dir.mkdir(parents=True, exist_ok=True)
+    return config_dir / "config.json"
 
 
 class Application(QObject):
@@ -61,7 +76,7 @@ class Application(QObject):
 
     def load_config(self):
         """Load configuration from config.json."""
-        config_path = Path(__file__).parent / "config.json"
+        config_path = get_config_path()
 
         if config_path.exists():
             try:
@@ -106,7 +121,7 @@ class Application(QObject):
 
     def save_config(self):
         """Save configuration to config.json."""
-        config_path = Path(__file__).parent / "config.json"
+        config_path = get_config_path()
 
         try:
             with open(config_path, "w", encoding="utf-8") as f:

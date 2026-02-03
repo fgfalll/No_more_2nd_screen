@@ -31,6 +31,7 @@ from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QFont
 
 import sys
+import os
 import win32gui
 import win32con
 import win32process
@@ -43,6 +44,21 @@ from core.monitor_info import (
     get_primary_device_name,
     MonitorGroup,
 )
+
+
+def get_config_path() -> str:
+    """Get config file path, using AppData for PyInstaller builds."""
+    from pathlib import Path
+    if getattr(sys, 'frozen', False):
+        # Running as exe - use AppData directory
+        config_dir = Path(os.environ.get('APPDATA', os.path.expanduser('~')))
+        config_dir = config_dir / "NoMore2ndScreen"
+    else:
+        # Running as Python script - use same directory as script
+        config_dir = Path(__file__).parent.parent
+
+    config_dir.mkdir(parents=True, exist_ok=True)
+    return str(config_dir / "config.json")
 
 
 class SettingsDialog(QDialog):
@@ -497,10 +513,8 @@ class SettingsDialog(QDialog):
     def save_config(self):
         """Save configuration to file."""
         import json
-        from pathlib import Path
 
-        script_dir = Path(__file__).parent
-        config_path = script_dir / "config.json"
+        config_path = get_config_path()
 
         try:
             existing_config = {}

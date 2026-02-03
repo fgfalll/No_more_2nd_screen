@@ -4,10 +4,25 @@ Whitelist management module.
 This module handles loading, saving, and checking the whitelist of allowed applications.
 """
 
+import sys
 import json
 import os
 from typing import List, Set
 from pathlib import Path
+
+
+def get_config_path() -> Path:
+    """Get config file path, using AppData for PyInstaller builds."""
+    if getattr(sys, 'frozen', False):
+        # Running as exe - use AppData directory
+        config_dir = Path(os.environ.get('APPDATA', os.path.expanduser('~')))
+        config_dir = config_dir / "NoMore2ndScreen"
+    else:
+        # Running as Python script - use same directory as script
+        config_dir = Path(__file__).parent.parent
+
+    config_dir.mkdir(parents=True, exist_ok=True)
+    return config_dir / "config.json"
 
 
 # Default whitelist entries
@@ -28,11 +43,10 @@ class Whitelist:
             config_path: Path to the config.json file. If None, uses default location.
         """
         if config_path is None:
-            # Get the directory where this script is located
-            script_dir = Path(__file__).parent.parent
-            config_path = script_dir / "config.json"
+            self.config_path = get_config_path()
+        else:
+            self.config_path = Path(config_path)
 
-        self.config_path = Path(config_path)
         self._whitelist: Set[str] = set()
         self._custom_whitelist: Set[str] = set()
         self.load()
